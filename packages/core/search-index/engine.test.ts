@@ -156,6 +156,30 @@ describe("SearchIndexEngine.searchIssues ranking", () => {
     expect(engine.searchIssues({ q: "4242" }).map((h) => h.id)).toEqual([target.id, textHit.id]);
   });
 
+  // Each project owns its own number series, so "GOAL-5" must not return
+  // "EXP-5", and a bare prefix lists that project's whole series.
+  it("matches prefix and number together for a multi-letter prefix", () => {
+    const goal = issue({ title: "goal five", number: 5, identifier: "GOAL-5" });
+    const exp = issue({ title: "exp five", number: 5, identifier: "EXP-5" });
+    const engine = engineWith([exp, goal]);
+
+    expect(engine.searchIssues({ q: "GOAL-5" }).map((h) => h.id)).toEqual([goal.id]);
+    expect(engine.searchIssues({ q: "goal-5" }).map((h) => h.id)).toEqual([goal.id]);
+    expect(engine.searchIssues({ q: "EXP-5" }).map((h) => h.id)).toEqual([exp.id]);
+    expect(engine.searchIssues({ q: "5" }).map((h) => h.id).sort()).toEqual([exp.id, goal.id].sort());
+  });
+
+  it("lists a project's whole series for a bare prefix", () => {
+    const g2 = issue({ title: "alpha", number: 2, identifier: "GOAL-2" });
+    const g3 = issue({ title: "beta", number: 3, identifier: "GOAL-3" });
+    const other = issue({ title: "gamma", number: 2, identifier: "EXP-2" });
+    const engine = engineWith([other, g2, g3]);
+
+    for (const q of ["GOAL", "goal-", " Goal "]) {
+      expect(engine.searchIssues({ q }).map((h) => h.id).sort()).toEqual([g2.id, g3.id].sort());
+    }
+  });
+
   it("keeps a cancelled digit-prefix identifier ahead of text hits before limiting", () => {
     const target = issue({ title: "no text overlap", number: 12, identifier: "V2-12", status: "cancelled" });
     const textHit = issue({ title: "notes about V2-12" });

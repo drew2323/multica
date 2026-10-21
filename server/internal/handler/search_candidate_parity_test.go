@@ -255,8 +255,8 @@ func TestBuildSearchQuery_CandidateFirstParity(t *testing.T) {
 func runBuiltSearchForParity(t *testing.T, phrase string, includeClosed bool, terminalKeys []string, limit, offset int) []searchParityRow {
 	t.Helper()
 	terms := splitSearchTerms(phrase)
-	queryNum, hasNum := parseQueryNumber(phrase)
-	query, args := buildSearchQuery(phrase, terms, queryNum, hasNum, includeClosed, terminalKeys)
+	queryPrefix, queryNum, hasNum := parseQueryIdentifier(phrase)
+	query, args := buildSearchQueryWithPrefix(phrase, terms, queryNum, hasNum, queryPrefix, includeClosed, terminalKeys)
 	args[3] = testWorkspaceID
 	args[len(args)-2] = limit
 	args[len(args)-1] = offset

@@ -46,6 +46,8 @@ export interface ProjectHit {
 
 interface IssueEntry {
   id: string;
+  /** Upper-cased project prefix taken from the identifier ("GOAL" of "GOAL-5"). */
+  prefix: string;
   number: number;
   status: string;
   terminal: boolean;
@@ -140,13 +142,39 @@ function isTerminal(issue: Pick<SearchIndexIssue, "status" | "status_category">)
   return category === "done" || category === "closed";
 }
 
-/** Server parseQueryNumber: "MUL-123", "V2-12", or a bare "123". */
-function parseQueryNumber(query: string): number | null {
+interface QueryIdentifier {
+  /** Upper-cased prefix, or "" for a bare number / no identifier. */
+  prefix: string;
+  /** Targeted issue number, or null when the query names a prefix only. */
+  number: number | null;
+}
+
+/**
+ * Server parseQueryIdentifier: "GOAL-5" -> prefix+number, "5" -> bare number,
+ * "GOAL" / "GOAL-" -> prefix only (1-10 letters/digits, letter-leading).
+ * Numbers are only unique per project prefix, so the prefix must be matched.
+ */
+function parseQueryIdentifier(query: string): QueryIdentifier | null {
   const q = query.trim();
-  const match = /^[a-z][a-z0-9]*-(\d+)$/i.exec(q) ?? /^(\d+)$/.exec(q);
-  if (!match) return null;
-  const n = Number.parseInt(match[1]!, 10);
-  return Number.isInteger(n) && n > 0 ? n : null;
+  const full = /^([a-z][a-z0-9]*)-(\d+)$/i.exec(q);
+  if (full) {
+    const n = Number.parseInt(full[2]!, 10);
+    if (Number.isInteger(n) && n > 0) return { prefix: full[1]!.toUpperCase(), number: n };
+  }
+  if (/^\d+$/.test(q)) {
+    const n = Number.parseInt(q, 10);
+    if (Number.isInteger(n) && n > 0) return { prefix: "", number: n };
+  }
+  const only = /^([a-z][a-z0-9]{0,9})-?$/i.exec(q);
+  if (only) return { prefix: only[1]!.toUpperCase(), number: null };
+  return null;
+}
+
+/** "GOAL-5" -> "GOAL"; an identifier without a dash yields "". */
+function identifierPrefix(identifier: string | null | undefined): string {
+  if (!identifier) return "";
+  const dash = identifier.lastIndexOf("-");
+  return dash > 0 ? identifier.slice(0, dash).toUpperCase() : "";
 }
 
 export class SearchIndexEngine {
@@ -180,6 +208,7 @@ export class SearchIndexEngine {
     const description = issue.description ?? "";
     const entry: IssueEntry = {
       id: issue.id,
+      prefix: identifierPrefix(issue.identifier),
       number: issue.number,
       status: issue.status,
       terminal: isTerminal(issue),
@@ -249,7 +278,7 @@ export class SearchIndexEngine {
     if (phrase === "") return [];
     const terms = splitSearchTerms(phrase);
     const multi = terms.length > 1;
-    const number = parseQueryNumber(params.q);
+    const ident = parseQueryIdentifier(params.q);
     const escapedPhrase = escapeLike(phrase);
 
     // One pass over the comments, keeping per-issue flags and the latest
@@ -333,11 +362,17 @@ export class SearchIndexEngine {
           if (!descriptionTerms[i]) descriptionAllTerms = false;
         }
       }
-      const numberExact = number !== null && issue.number === number;
+      const numberExact =
+        ident !== null &&
+        ident.number !== null &&
+        issue.number === ident.number &&
+        (ident.prefix === "" || issue.prefix === ident.prefix);
+      const prefixMatch =
+        ident !== null && ident.number === null && ident.prefix !== "" && issue.prefix === ident.prefix;
       const comments = byIssue.get(issue.id);
       const commentPhrase = comments?.phrase ?? false;
 
-      let eligible = titlePhrase || descriptionPhrase || commentPhrase || numberExact;
+      let eligible = titlePhrase || descriptionPhrase || commentPhrase || numberExact || prefixMatch;
       if (!eligible && multi) {
         eligible = true;
         for (let i = 0; i < terms.length; i++) {
@@ -355,6 +390,7 @@ export class SearchIndexEngine {
       else if (titleStartsWith) relevance = 2;
       else if (titlePhrase) relevance = 3;
       else if (titleAllTerms) relevance = 4;
+      else if (prefixMatch) relevance = 4;
       else if (descriptionPhrase) relevance = 5;
       else if (descriptionAllTerms) relevance = 6;
       else if (commentPhrase) relevance = 7;

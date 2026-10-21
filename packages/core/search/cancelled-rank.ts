@@ -23,24 +23,35 @@ import type { SearchIssueResult, SearchProjectResult } from "../types/api";
 import { issueBehavesAs } from "../issues/status-category";
 
 /**
- * Mirrors the server's identifier pattern (parseQueryNumber in
+ * Mirrors the server's identifier pattern (parseQueryIdentifier in
  * server/internal/handler/issue.go): "MUL-123", "V2-12", or a bare "123".
  */
-const IDENTIFIER_NUMBER_RE = /^[a-z][a-z0-9]*-(\d+)$/i;
+const IDENTIFIER_NUMBER_RE = /^([a-z][a-z0-9]*)-(\d+)$/i;
 
-/** Extracts the issue number a query targets, or null when it targets none. */
-export function parseSearchQueryNumber(query: string): number | null {
+/**
+ * Splits a query into the project prefix and issue number it targets.
+ * Numbers repeat across projects, so a query with a prefix only targets the
+ * issue carrying that same prefix. `prefix` is "" for a bare number.
+ */
+export function parseSearchQueryIdentifier(
+  query: string,
+): { prefix: string; number: number } | null {
   const q = query.trim();
   const m = IDENTIFIER_NUMBER_RE.exec(q);
   if (m) {
-    const n = Number.parseInt(m[1]!, 10);
-    if (Number.isInteger(n) && n > 0) return n;
+    const n = Number.parseInt(m[2]!, 10);
+    if (Number.isInteger(n) && n > 0) return { prefix: m[1]!.toUpperCase(), number: n };
   }
   if (/^\d+$/.test(q)) {
     const n = Number.parseInt(q, 10);
-    if (Number.isInteger(n) && n > 0) return n;
+    if (Number.isInteger(n) && n > 0) return { prefix: "", number: n };
   }
   return null;
+}
+
+/** Extracts the issue number a query targets, or null when it targets none. */
+export function parseSearchQueryNumber(query: string): number | null {
+  return parseSearchQueryIdentifier(query)?.number ?? null;
 }
 
 function isExactTitle(title: string | null | undefined, query: string): boolean {
@@ -72,12 +83,18 @@ export function isIssueDirectHit(
   },
   query: string,
 ): boolean {
-  const targetNumber = parseSearchQueryNumber(query);
-  if (targetNumber !== null) {
-    const issueNumber =
-      issue.number ??
-      (issue.identifier ? parseSearchQueryNumber(issue.identifier) : null);
-    if (issueNumber === targetNumber) return true;
+  const target = parseSearchQueryIdentifier(query);
+  if (target !== null) {
+    const fromIdentifier = issue.identifier
+      ? parseSearchQueryIdentifier(issue.identifier)
+      : null;
+    const issueNumber = issue.number ?? fromIdentifier?.number ?? null;
+    // Without a prefix in the query any project's number matches; with one,
+    // the issue's own prefix (from its identifier) has to agree.
+    const prefixOk =
+      target.prefix === "" ||
+      (fromIdentifier !== null && fromIdentifier.prefix === target.prefix);
+    if (issueNumber === target.number && prefixOk) return true;
   }
   if (
     issue.identifier &&

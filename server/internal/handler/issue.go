@@ -778,21 +778,40 @@ func splitSearchTerms(q string) []string {
 // identifierNumberRe matches letter-leading prefixes like "MUL-123" or "V2-12".
 var identifierNumberRe = regexp.MustCompile(`(?i)^[a-z][a-z0-9]*-(\d+)$`)
 
-// parseQueryNumber extracts an issue number from the query if it looks like
-// an identifier (e.g. "MUL-123" or "V2-12") or a bare number (e.g. "123").
+// parseQueryNumber returns only the number part of parseQueryIdentifier.
 func parseQueryNumber(q string) (int, bool) {
+	_, n, ok := parseQueryIdentifier(q)
+	return n, ok
+}
+
+// identifierPrefixOnlyRe matches a bare issue prefix such as "GOAL" or the
+// not-yet-finished identifier "GOAL-" (prefixes are 1-10 letters/digits and
+// letter-leading, see normalizeIssuePrefix).
+var identifierPrefixOnlyRe = regexp.MustCompile(`(?i)^([a-z][a-z0-9]{0,9})-?$`)
+
+// parseQueryIdentifier splits a search query into the project prefix and the
+// issue number it targets. Numbers are only unique within one prefix (each
+// project owns its own series), so "GOAL-5" must not match "EXP-5".
+//
+//	"GOAL-5" -> ("GOAL", 5, true)   prefix and number
+//	"5"      -> ("", 5, true)       bare number, any prefix
+//	"GOAL"   -> ("GOAL", 0, false)  prefix only (also "GOAL-")
+//	otherwise -> ("", 0, false)
+func parseQueryIdentifier(q string) (prefix string, number int, hasNumber bool) {
 	q = strings.TrimSpace(q)
-	// Check for identifier pattern like "MUL-123"
 	if m := identifierNumberRe.FindStringSubmatch(q); m != nil {
 		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
-			return n, true
+			dash := strings.LastIndex(q, "-")
+			return strings.ToUpper(q[:dash]), n, true
 		}
 	}
-	// Check for bare number
 	if n, err := strconv.Atoi(q); err == nil && n > 0 {
-		return n, true
+		return "", n, true
 	}
-	return 0, false
+	if m := identifierPrefixOnlyRe.FindStringSubmatch(q); m != nil {
+		return strings.ToUpper(m[1]), 0, false
+	}
+	return "", 0, false
 }
 
 // searchResult holds a raw row from the dynamic search query.
@@ -808,6 +827,14 @@ type searchResult struct {
 // trades the title, description, and comment content GIN fast paths for one
 // predictable pass over each relation within the selected workspace.
 func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, includeClosed bool, terminalStatusKeys []string) (string, []any) {
+	return buildSearchQueryWithPrefix(phrase, terms, queryNum, hasNum, "", includeClosed, terminalStatusKeys)
+}
+
+// buildSearchQueryWithPrefix is buildSearchQuery plus an optional project
+// prefix. With a number the identifier match requires prefix AND number; with
+// a prefix only, every issue in that project's series is an eligible hit
+// ranked just below title matches.
+func buildSearchQueryWithPrefix(phrase string, terms []string, queryNum int, hasNum bool, queryPrefix string, includeClosed bool, terminalStatusKeys []string) (string, []any) {
 	// Lowercase in Go so SQL only needs LOWER() on the column side.
 	phrase = strings.ToLower(phrase)
 	for i, term := range terms {
@@ -837,6 +864,12 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 	if hasNum {
 		numParam = nextArg(queryNum)
 	}
+	prefixParam := ""
+	if queryPrefix != "" {
+		prefixParam = nextArg(queryPrefix)
+	}
+	// prefixOnly: the query names a project but no number.
+	prefixOnly := prefixParam != "" && !hasNum
 
 	terminalStatusesParam := ""
 	if !includeClosed {
@@ -877,7 +910,14 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 		fmt.Sprintf("COALESCE(%s LIKE %s, FALSE) AS description_phrase", loweredIssueDescription, phraseContainsParam),
 	}
 	if hasNum {
-		issueFlagColumns = append(issueFlagColumns, fmt.Sprintf("i.number = %s AS number_exact", numParam))
+		numberExact := fmt.Sprintf("i.number = %s", numParam)
+		if prefixParam != "" {
+			numberExact = fmt.Sprintf("(i.identifier_prefix = %s AND %s)", prefixParam, numberExact)
+		}
+		issueFlagColumns = append(issueFlagColumns, numberExact+" AS number_exact")
+	}
+	if prefixOnly {
+		issueFlagColumns = append(issueFlagColumns, fmt.Sprintf("i.identifier_prefix = %s AS prefix_match", prefixParam))
 	}
 	for index, termParam := range termContainsParams {
 		issueFlagColumns = append(issueFlagColumns,
@@ -1001,6 +1041,9 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 	if hasNum {
 		eligibleParts = append(eligibleParts, "im.number_exact")
 	}
+	if prefixOnly {
+		eligibleParts = append(eligibleParts, "im.prefix_match")
+	}
 	eligibleExpr := "(" + strings.Join(eligibleParts, " OR ") + ")"
 
 	rankCases := []string{}
@@ -1012,6 +1055,11 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 		"WHEN im.title_starts_with THEN 2",
 		"WHEN im.title_phrase THEN 3",
 	)
+	if prefixOnly {
+		// A project's whole series is a weaker signal than a title hit but
+		// stronger than a description or comment mention of the word.
+		rankCases = append(rankCases, "WHEN im.prefix_match THEN 4")
+	}
 	if len(termContainsParams) > 1 {
 		var titleTerms []string
 		for index := range termContainsParams {
@@ -1152,7 +1200,7 @@ func (h *Handler) SearchIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	terms := splitSearchTerms(q)
-	queryNum, hasNum := parseQueryNumber(q)
+	queryPrefix, queryNum, hasNum := parseQueryIdentifier(q)
 	var terminalStatusKeys []string
 	if !includeClosed {
 		resolvedKeys, err := h.terminalIssueStatusKeys(ctx, wsUUID)
@@ -1164,7 +1212,7 @@ func (h *Handler) SearchIssues(w http.ResponseWriter, r *http.Request) {
 		terminalStatusKeys = resolvedKeys
 	}
 
-	sqlQuery, args := buildSearchQuery(q, terms, queryNum, hasNum, includeClosed, terminalStatusKeys)
+	sqlQuery, args := buildSearchQueryWithPrefix(q, terms, queryNum, hasNum, queryPrefix, includeClosed, terminalStatusKeys)
 	// Fill placeholder args: $4 = workspace_id, last two = limit, offset
 	args[3] = wsUUID
 	args[len(args)-2] = limit
@@ -1930,8 +1978,14 @@ func appendIssueTableSearchFilter(where []string, addArg func(any) string, raw s
 		}
 		ors = append(ors, "("+strings.Join(titleMatches, " AND ")+")")
 	}
-	if number, ok := parseQueryNumber(query); ok {
-		ors = append(ors, fmt.Sprintf("i.number = %s", addArg(number)))
+	if prefix, number, ok := parseQueryIdentifier(query); ok {
+		if prefix != "" {
+			ors = append(ors, fmt.Sprintf("(i.identifier_prefix = %s AND i.number = %s)", addArg(prefix), addArg(number)))
+		} else {
+			ors = append(ors, fmt.Sprintf("i.number = %s", addArg(number)))
+		}
+	} else if prefix != "" {
+		ors = append(ors, fmt.Sprintf("i.identifier_prefix = %s", addArg(prefix)))
 	}
 	if len(ors) == 0 {
 		return where

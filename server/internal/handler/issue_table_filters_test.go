@@ -145,10 +145,14 @@ func TestListIssues_TableFacetsAreServerSide(t *testing.T) {
 	assertList("&q="+url.QueryEscape("progress "+token), issueB)
 	assertList("&q="+url.QueryEscape("progress")+"&statuses=in_progress", issueB)
 	var issueBNumber int
-	if err := testPool.QueryRow(ctx, `SELECT number FROM issue WHERE id = $1`, issueB).Scan(&issueBNumber); err != nil {
+	var issueBPrefix string
+	if err := testPool.QueryRow(ctx, `SELECT number, identifier_prefix FROM issue WHERE id = $1`, issueB).Scan(&issueBNumber, &issueBPrefix); err != nil {
 		t.Fatalf("read issue number: %v", err)
 	}
-	assertList("&q="+url.QueryEscape(fmt.Sprintf("MUL-%d", issueBNumber)), issueB)
+	assertList("&q="+url.QueryEscape(fmt.Sprintf("%s-%d", issueBPrefix, issueBNumber)), issueB)
+	// The identifier carries the project prefix, so another project's prefix
+	// with the same number must not match.
+	assertList("&q=" + url.QueryEscape(fmt.Sprintf("NOPE-%d", issueBNumber)))
 	assertList(
 		"&statuses=todo&priorities=high&include_no_assignee=true&label_ids="+labelA+"&top_level_only=true",
 		issueA,

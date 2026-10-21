@@ -4,6 +4,7 @@ import type { SearchIssueResult, SearchProjectResult } from "../types/api";
 import {
   isIssueDirectHit,
   isProjectDirectHit,
+  parseSearchQueryIdentifier,
   parseSearchQueryNumber,
   partitionAggregatedSearchResults,
   partitionStable,
@@ -62,6 +63,18 @@ describe("parseSearchQueryNumber", () => {
   });
 });
 
+describe("parseSearchQueryIdentifier", () => {
+  it("returns prefix and number, or an empty prefix for a bare number", () => {
+    expect(parseSearchQueryIdentifier("GOAL-5")).toEqual({ prefix: "GOAL", number: 5 });
+    expect(parseSearchQueryIdentifier(" goal-5 ")).toEqual({ prefix: "GOAL", number: 5 });
+    expect(parseSearchQueryIdentifier("5")).toEqual({ prefix: "", number: 5 });
+  });
+
+  it.each(["GOAL", "GOAL-", "V2-0", "", "hello"])("returns null for %s", (query) =>
+    expect(parseSearchQueryIdentifier(query)).toBeNull(),
+  );
+});
+
 describe("direct hits", () => {
   it("treats an exact identifier, number, or title as targeting the issue", () => {
     const it1 = issue({ id: "i1", number: 42, identifier: "MUL-42", title: "Ship it" });
@@ -95,6 +108,20 @@ describe("direct hits", () => {
     const row = { number: 42, identifier: "MUL-77", title: "t" };
     expect(isIssueDirectHit(row, "42")).toBe(true);
     expect(isIssueDirectHit(row, "77")).toBe(false);
+  });
+
+  // Numbers repeat across projects (each owns its own series), so a query
+  // carrying a prefix must only target the issue with that same prefix.
+  it("requires the prefix to match when the query has one", () => {
+    const goal = { number: 5, identifier: "GOAL-5", title: "Goal" };
+    const exp = { number: 5, identifier: "EXP-5", title: "Exp" };
+    expect(isIssueDirectHit(goal, "GOAL-5")).toBe(true);
+    expect(isIssueDirectHit(goal, "goal-5")).toBe(true);
+    expect(isIssueDirectHit(exp, "GOAL-5")).toBe(false);
+    expect(isIssueDirectHit(goal, "EXP-5")).toBe(false);
+    // A bare number still targets every project.
+    expect(isIssueDirectHit(goal, "5")).toBe(true);
+    expect(isIssueDirectHit(exp, "5")).toBe(true);
   });
 
   it("is not a direct hit when nothing identifies the row", () => {
